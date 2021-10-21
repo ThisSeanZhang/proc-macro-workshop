@@ -21,6 +21,8 @@ fn do_expand(st: &syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
     let builder_fields_default = generate_builder_struct_factory_init_clauses(fields)?;
     let builder_setter_clauses = builder_setter_clauses(fields)?;
+
+    let generate_build_function = generate_build_function(fields, source_ident)?;
     let ret = quote! {
         pub struct #builder_ident {
             #builder_fields
@@ -34,6 +36,8 @@ fn do_expand(st: &syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
         impl #builder_ident {
             #(#builder_setter_clauses)*
+
+            #generate_build_function
         }
     };
 
@@ -87,4 +91,37 @@ fn builder_setter_clauses(fields: &StructFields) -> syn::Result<Vec<proc_macro2:
     }).collect();
 
     Ok(init_clauses)
+}
+
+fn generate_build_function(fields: &StructFields, source_ident: &syn::Ident) -> syn::Result<proc_macro2::TokenStream>{
+    let idens: Vec<_> = fields.iter().map(|f| &f.ident).collect();
+    
+    let judge_fields = idens.iter()
+    .map(|&ident| {
+        quote! {
+            if self.#ident.is_none() {
+                let err = format!("{} field missing", stringify!(#ident));
+                return std::result::Result::Err(err.into())
+            }
+        }
+    })
+    .fold(proc_macro2::TokenStream::new(), |mut all, span| { all.extend(span); all});
+
+    let fill_in_source = idens.iter()
+    .map(|&ident| {
+        quote! {
+            #ident: self.#ident.take().unwrap(),
+        }
+    })
+    .fold(proc_macro2::TokenStream::new(), |mut all, span| { all.extend(span); all});
+
+    Ok(quote! {
+        pub fn build(&mut self) -> std::result::Result<#source_ident, std::boxed::Box<dyn std::error::Error>> {
+            #judge_fields
+
+            std::result::Result::Ok(#source_ident{
+                #fill_in_source
+            })
+        }
+    })
 }
