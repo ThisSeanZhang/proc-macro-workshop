@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
-use syn::{self, DeriveInput, Fields, spanned::Spanned};
-use quote::{ToTokens, quote};
+use syn::{spanned::Spanned};
+use quote::{quote};
 
  // 注意，这里和第一篇文章里的 #[proc_macro_attribute]不同
  #[proc_macro_derive(Builder)]
@@ -58,13 +58,22 @@ fn get_fields_from_derive_input(input: &syn::DeriveInput) -> syn::Result<&Struct
 }
 fn generate_builder_struct_fields_def(fields: &StructFields) -> syn::Result<proc_macro2::TokenStream>{
     let idents: Vec<_> = fields.iter().map(|f| &f.ident ).collect();
-    let types: Vec<_> = fields.iter().map(|f| &f.ty ).collect();
-
-    let attributes = quote! {
-        #(#idents: std::option::Option<#types>),*
-    };
-
-    Ok(attributes)
+    let types: Vec<_> = fields
+        .iter()
+        .map(|f| {
+            // 针对是否为`Option`类型字段，产生不同的结果
+            if let Some(inner_ty) = get_optional_inner_type(&f.ty) {
+                quote!(std::option::Option<#inner_ty>)
+            } else {
+                let origin_ty = &f.ty;
+                quote!(std::option::Option<#origin_ty>)
+            }
+        })
+        .collect();
+    Ok(quote! {
+        // 下面这一行，也做了修改
+        #(#idents: #types),*
+    })
 }
 
 fn generate_builder_struct_factory_init_clauses(fields: &StructFields) -> syn::Result<Vec<proc_macro2::TokenStream>>{
@@ -81,7 +90,7 @@ fn generate_builder_struct_factory_init_clauses(fields: &StructFields) -> syn::R
 fn builder_setter_clauses(fields: &StructFields) -> syn::Result<Vec<proc_macro2::TokenStream>>{
     let init_clauses: Vec<_> = fields.iter().map(|f| {
         let ident = &f.ident;
-        let ty = &f.ty;
+        let ty = get_optional_inner_type(&f.ty).unwrap_or(&f.ty);
         quote!{
             fn #ident(&mut self, #ident: #ty)->&mut Self {
                 self.#ident = std::option::Option::Some(#ident);
@@ -94,10 +103,13 @@ fn builder_setter_clauses(fields: &StructFields) -> syn::Result<Vec<proc_macro2:
 }
 
 fn generate_build_function(fields: &StructFields, source_ident: &syn::Ident) -> syn::Result<proc_macro2::TokenStream>{
-    let idens: Vec<_> = fields.iter().map(|f| &f.ident).collect();
     
-    let judge_fields = idens.iter()
-    .map(|&ident| {
+    let judge_fields = fields.iter()
+    .filter(|f| {
+        get_optional_inner_type(&f.ty).is_none()
+    })
+    .map(|f| &f.ident)
+    .map(|ident| {
         quote! {
             if self.#ident.is_none() {
                 let err = format!("{} field missing", stringify!(#ident));
@@ -107,10 +119,17 @@ fn generate_build_function(fields: &StructFields, source_ident: &syn::Ident) -> 
     })
     .fold(proc_macro2::TokenStream::new(), |mut all, span| { all.extend(span); all});
 
-    let fill_in_source = idens.iter()
-    .map(|&ident| {
-        quote! {
-            #ident: self.#ident.take().unwrap(),
+    let fill_in_source = fields.iter()
+    .map(|f| {
+        let ident = &f.ident;
+        if get_optional_inner_type(&f.ty).is_none() {
+            quote! {
+                #ident: self.#ident.take().unwrap(),
+            }
+        } else {
+            quote! {
+                #ident: self.#ident.take(),
+            }
         }
     })
     .fold(proc_macro2::TokenStream::new(), |mut all, span| { all.extend(span); all});
@@ -124,4 +143,21 @@ fn generate_build_function(fields: &StructFields, source_ident: &syn::Ident) -> 
             })
         }
     })
+}
+
+fn get_optional_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+    if let syn::Type::Path(syn::TypePath{ ref path,..}) = ty {
+        if let Some(seg) = path.segments.last() {
+            if seg.ident == "Option" {
+                if let syn::PathArguments::AngleBracketed(syn::AngleBracketedGenericArguments{
+                    ref args, ..
+                }) = seg.arguments {
+                    if let Some(syn::GenericArgument::Type(ref inner_type)) = args.first() {
+                        return Some(inner_type);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
