@@ -3,7 +3,7 @@ use syn::{spanned::Spanned};
 use quote::{quote};
 
  // 注意，这里和第一篇文章里的 #[proc_macro_attribute]不同
- #[proc_macro_derive(Builder)]
+ #[proc_macro_derive(Builder,attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
     let st = syn::parse_macro_input!(input as syn::DeriveInput);
     match do_expand(&st) {
@@ -26,7 +26,7 @@ fn do_expand(st: &syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let ret = quote! {
         pub struct #builder_ident {
             #builder_fields
-        }   
+        }
         impl #source_ident {
             pub fn builder() -> #builder_ident {
                 #builder_ident {
@@ -62,8 +62,12 @@ fn generate_builder_struct_fields_def(fields: &StructFields) -> syn::Result<proc
         .iter()
         .map(|f| {
             // 针对是否为`Option`类型字段，产生不同的结果
-            if let Some(inner_ty) = get_optional_inner_type(&f.ty) {
+            if let Some(inner_ty) = get_optional_inner_type(&f.ty,"Option") {
                 quote!(std::option::Option<#inner_ty>)
+            } else if get_user_specified_ident_for_vec(f).is_some() {
+                let origin_ty = &f.ty;
+                quote!(#origin_ty)  // 题目中设定，如果用户指定了each属性，我们就可以认为它一定是作用在一个Vec字段上
+
             } else {
                 let origin_ty = &f.ty;
                 quote!(std::option::Option<#origin_ty>)
@@ -79,8 +83,14 @@ fn generate_builder_struct_fields_def(fields: &StructFields) -> syn::Result<proc
 fn generate_builder_struct_factory_init_clauses(fields: &StructFields) -> syn::Result<Vec<proc_macro2::TokenStream>>{
     let init_clauses: Vec<_> = fields.iter().map(|f| {
         let ident = &f.ident;
-        quote!{
-            #ident: std::option::Option::None
+        if get_user_specified_ident_for_vec(f).is_some() {
+            quote!{
+                #ident: std::vec::Vec::new()
+            }
+        } else {
+            quote!{
+                #ident: std::option::Option::None
+            }
         }
     }).collect();
 
@@ -90,13 +100,35 @@ fn generate_builder_struct_factory_init_clauses(fields: &StructFields) -> syn::R
 fn builder_setter_clauses(fields: &StructFields) -> syn::Result<Vec<proc_macro2::TokenStream>>{
     let init_clauses: Vec<_> = fields.iter().map(|f| {
         let ident = &f.ident;
-        let ty = get_optional_inner_type(&f.ty).unwrap_or(&f.ty);
-        quote!{
+        let type_ = &f.ty;
+        if let Some(ref user_specified_ident) = get_user_specified_ident_for_vec(f) {
+            let inner_ty = get_optional_inner_type(type_,"Vec").ok_or(syn::Error::new(f.span(),"each field must be specified with Vec field")).unwrap();
+            let other_setter = if user_specified_ident != ident.as_ref().unwrap() {
+                quote! {
+                    fn #ident(&mut self, #ident: #type_) -> &mut Self {
+                        self.#ident = #ident;
+                        self
+                    }
+                }
+            } else {
+                quote!()
+            };
+            return quote! {
+                fn #user_specified_ident(&mut self, #user_specified_ident: #inner_ty) -> &mut Self {
+                    self.#ident.push(#user_specified_ident);
+                    self
+                }
+
+                #other_setter
+            };
+        }
+        let ty = get_optional_inner_type(&f.ty, "Option").unwrap_or(&f.ty);
+        return quote!{
             fn #ident(&mut self, #ident: #ty)->&mut Self {
                 self.#ident = std::option::Option::Some(#ident);
                 self
             } 
-        }
+        };
     }).collect();
 
     Ok(init_clauses)
@@ -106,7 +138,10 @@ fn generate_build_function(fields: &StructFields, source_ident: &syn::Ident) -> 
     
     let judge_fields = fields.iter()
     .filter(|f| {
-        get_optional_inner_type(&f.ty).is_none()
+        get_optional_inner_type(&f.ty, "Option").is_none()
+    })
+    .filter(|f| {
+        get_user_specified_ident_for_vec(&f).is_none()
     })
     .map(|f| &f.ident)
     .map(|ident| {
@@ -122,7 +157,11 @@ fn generate_build_function(fields: &StructFields, source_ident: &syn::Ident) -> 
     let fill_in_source = fields.iter()
     .map(|f| {
         let ident = &f.ident;
-        if get_optional_inner_type(&f.ty).is_none() {
+        if get_user_specified_ident_for_vec(f).is_some() {
+            quote! {
+                #ident: self.#ident.drain(..).collect(),
+            }
+        } else if get_optional_inner_type(&f.ty, "Option").is_none() {
             quote! {
                 #ident: self.#ident.take().unwrap(),
             }
@@ -145,15 +184,41 @@ fn generate_build_function(fields: &StructFields, source_ident: &syn::Ident) -> 
     })
 }
 
-fn get_optional_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+fn get_optional_inner_type<'a>(ty: &'a syn::Type, outer_ident_name: &'a str) -> Option<&'a syn::Type> {
     if let syn::Type::Path(syn::TypePath{ ref path,..}) = ty {
         if let Some(seg) = path.segments.last() {
-            if seg.ident == "Option" {
+            if seg.ident == outer_ident_name  {
                 if let syn::PathArguments::AngleBracketed(syn::AngleBracketedGenericArguments{
                     ref args, ..
                 }) = seg.arguments {
                     if let Some(syn::GenericArgument::Type(ref inner_type)) = args.first() {
                         return Some(inner_type);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn get_user_specified_ident_for_vec(field: &syn::Field) -> Option<syn::Ident> {
+    for attr in &field.attrs {
+        if let Ok(syn::Meta::List(syn::MetaList {
+            ref path,
+            ref nested,
+            ..
+        })) = attr.parse_meta() {
+            if let Some(p) = path.segments.first() {
+                if p.ident == "builder" {
+                    if let Some(syn::NestedMeta::Meta(syn::Meta::NameValue(kv))) = nested.first() {
+                        if kv.path.is_ident("each") {
+                            if let syn::Lit::Str(ref ident_str) = kv.lit {
+                                return Some(syn::Ident::new(
+                                    ident_str.value().as_str(),
+                                    attr.span(),
+                                ));
+                            }
+                        }
                     }
                 }
             }
