@@ -58,50 +58,52 @@ fn get_fields_from_derive_input(input: &syn::DeriveInput) -> syn::Result<&Struct
 }
 fn generate_builder_struct_fields_def(fields: &StructFields) -> syn::Result<proc_macro2::TokenStream>{
     let idents: Vec<_> = fields.iter().map(|f| &f.ident ).collect();
-    let types: Vec<_> = fields
+    let types: syn::Result<Vec<proc_macro2::TokenStream>> = fields
         .iter()
         .map(|f| {
             // 针对是否为`Option`类型字段，产生不同的结果
             if let Some(inner_ty) = get_optional_inner_type(&f.ty,"Option") {
-                quote!(std::option::Option<#inner_ty>)
-            } else if get_user_specified_ident_for_vec(f).is_some() {
+                Ok(quote!(std::option::Option<#inner_ty>))
+            } else if get_user_specified_ident_for_vec(f)?.is_some() {
                 let origin_ty = &f.ty;
-                quote!(#origin_ty)  // 题目中设定，如果用户指定了each属性，我们就可以认为它一定是作用在一个Vec字段上
+                Ok(quote!(#origin_ty))  // 题目中设定，如果用户指定了each属性，我们就可以认为它一定是作用在一个Vec字段上
 
             } else {
                 let origin_ty = &f.ty;
-                quote!(std::option::Option<#origin_ty>)
+                Ok(quote!(std::option::Option<#origin_ty>))
             }
         })
         .collect();
-    Ok(quote! {
-        // 下面这一行，也做了修改
+    let types = types?;
+    let token_stream = quote! {
         #(#idents: #types),*
-    })
+    };
+    Ok(token_stream)
 }
 
 fn generate_builder_struct_factory_init_clauses(fields: &StructFields) -> syn::Result<Vec<proc_macro2::TokenStream>>{
-    let init_clauses: Vec<_> = fields.iter().map(|f| {
+    let init_clauses: syn::Result<Vec<proc_macro2::TokenStream>> = fields.iter().map(|f| {
         let ident = &f.ident;
-        if get_user_specified_ident_for_vec(f).is_some() {
-            quote!{
+        if get_user_specified_ident_for_vec(f)?.is_some() {
+           Ok(quote!{
                 #ident: std::vec::Vec::new()
-            }
+            })
         } else {
-            quote!{
+            Ok(quote!{
                 #ident: std::option::Option::None
-            }
+            })
         }
     }).collect();
 
-    Ok(init_clauses)
+    Ok(init_clauses?)
 }
 
 fn builder_setter_clauses(fields: &StructFields) -> syn::Result<Vec<proc_macro2::TokenStream>>{
-    let init_clauses: Vec<_> = fields.iter().map(|f| {
+    let init_clauses: syn::Result<Vec<proc_macro2::TokenStream>> = fields.iter().map(|f| {
         let ident = &f.ident;
         let type_ = &f.ty;
-        if let Some(ref user_specified_ident) = get_user_specified_ident_for_vec(f) {
+        let specified_ident_for_vec = get_user_specified_ident_for_vec(f)?;
+        if let Some(ref user_specified_ident) = specified_ident_for_vec {
             let inner_ty = get_optional_inner_type(type_,"Vec").ok_or(syn::Error::new(f.span(),"each field must be specified with Vec field")).unwrap();
             let other_setter = if user_specified_ident != ident.as_ref().unwrap() {
                 quote! {
@@ -113,25 +115,25 @@ fn builder_setter_clauses(fields: &StructFields) -> syn::Result<Vec<proc_macro2:
             } else {
                 quote!()
             };
-            return quote! {
+            return Ok(quote! {
                 fn #user_specified_ident(&mut self, #user_specified_ident: #inner_ty) -> &mut Self {
                     self.#ident.push(#user_specified_ident);
                     self
                 }
 
                 #other_setter
-            };
+            });
         }
         let ty = get_optional_inner_type(&f.ty, "Option").unwrap_or(&f.ty);
-        return quote!{
+        return Ok(quote!{
             fn #ident(&mut self, #ident: #ty)->&mut Self {
                 self.#ident = std::option::Option::Some(#ident);
                 self
             } 
-        };
+        });
     }).collect();
 
-    Ok(init_clauses)
+    Ok(init_clauses?)
 }
 
 fn generate_build_function(fields: &StructFields, source_ident: &syn::Ident) -> syn::Result<proc_macro2::TokenStream>{
@@ -141,7 +143,11 @@ fn generate_build_function(fields: &StructFields, source_ident: &syn::Ident) -> 
         get_optional_inner_type(&f.ty, "Option").is_none()
     })
     .filter(|f| {
-        get_user_specified_ident_for_vec(&f).is_none()
+        if let Ok(inner) = get_user_specified_ident_for_vec(&f) {
+            inner.is_none()
+        } else {
+            false
+        }
     })
     .map(|f| &f.ident)
     .map(|ident| {
@@ -157,7 +163,7 @@ fn generate_build_function(fields: &StructFields, source_ident: &syn::Ident) -> 
     let fill_in_source = fields.iter()
     .map(|f| {
         let ident = &f.ident;
-        if get_user_specified_ident_for_vec(f).is_some() {
+        if let Ok(Some(_)) = get_user_specified_ident_for_vec(f) {
             quote! {
                 #ident: self.#ident.drain(..).collect(),
             }
@@ -201,7 +207,7 @@ fn get_optional_inner_type<'a>(ty: &'a syn::Type, outer_ident_name: &'a str) -> 
     None
 }
 
-fn get_user_specified_ident_for_vec(field: &syn::Field) -> Option<syn::Ident> {
+fn get_user_specified_ident_for_vec(field: &syn::Field) -> syn::Result<Option<syn::Ident>> {
     for attr in &field.attrs {
         if let Ok(syn::Meta::List(syn::MetaList {
             ref path,
@@ -213,16 +219,21 @@ fn get_user_specified_ident_for_vec(field: &syn::Field) -> Option<syn::Ident> {
                     if let Some(syn::NestedMeta::Meta(syn::Meta::NameValue(kv))) = nested.first() {
                         if kv.path.is_ident("each") {
                             if let syn::Lit::Str(ref ident_str) = kv.lit {
-                                return Some(syn::Ident::new(
+                                return Ok(Some(syn::Ident::new(
                                     ident_str.value().as_str(),
                                     attr.span(),
-                                ));
+                                )));
+                            }
+                        } else {
+                            // 第八关加入，注意这里new_spanned函数的参数，我们需要在语法树中找到一个合适的节点来获取它的span，如果这个语法树节点找的不对，产生出的错误信息就会不一样
+                            if let Ok(syn::Meta::List(ref list)) = attr.parse_meta() {
+                                return Err(syn::Error::new_spanned(list, r#"expected `builder(each = "...")`"#))
                             }
                         }
-                    }
+                    } 
                 }
             }
         }
     }
-    None
+    Ok(None)
 }
